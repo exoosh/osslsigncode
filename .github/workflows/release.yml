@@ -1,0 +1,456 @@
+name: Release
+
+# Build portable, release binaries for every supported architecture on a
+# version tag, then attach them (plus a SHA256SUMS.txt for pinning) to the
+# GitHub release.
+#
+#   Linux   -> fully-static musl binaries (zero shared-lib deps), built in
+#              Alpine on native amd64 and arm64 runners.
+#   macOS   -> arm64 + x86_64, third-party libs (OpenSSL/zlib) linked
+#              statically via vcpkg; only system libs remain dynamic.
+#   Windows -> arm64 + x64 static (MSVC static CRT + static deps) -> single self
+#              contained .exe.
+
+on:
+  push:
+    tags:
+      - '[0-9]+.[0-9]+'
+      - '[0-9]+.[0-9]+.[0-9]+'
+      - '[0-9]+.[0-9]+-*'
+      - '[0-9]+.[0-9]+.[0-9]+-*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Version string to embed in asset names (e.g. 2.15).'
+        required: true
+
+env:
+  BUILD_TYPE: Release
+
+permissions:
+  contents: read
+
+jobs:
+  # --------------------------------------------------------------------------
+  # Linux: fully-static musl binaries. Alpine is the canonical place static
+  # linking of OpenSSL + zlib
+  # --------------------------------------------------------------------------
+  linux:
+    name: linux-${{ matrix.arch }}
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - arch: amd64
+            os: ubuntu-24.04
+            py_arch: x64
+          - arch: arm64
+            os: ubuntu-24.04-arm
+            py_arch: arm64
+    runs-on: ${{ matrix.os }}
+    container: alpine:3.20
+    steps:
+      # Handle github actions shenanigans on linux alpine arm
+      - uses: laverdet/alpine-arm64@v1
+        if: matrix.arch == 'arm64'
+
+      # Get the version currently being built
+      - name: Resolve version
+        run: echo "VERSION=${{ github.event.inputs.tag || github.ref_name }}" >> "$GITHUB_ENV"
+
+      - name: Install system packages
+        shell: sh
+        run: |
+          apk add --update --no-cache \
+            git bash build-base cmake ninja \
+            python3 py3-cryptography py3-pip openssl \
+            openssl-dev openssl-libs-static \
+            wget tar perl \
+            zlib-dev zlib-static linux-headers \
+            nghttp2-static brotli-static zstd-static \
+            libidn2-static c-ares-static libpsl-static libunistring-static
+
+      # Ensure the cryptography package is available
+      - name: Validate Python Setup
+        run: |
+          python -c "import sys; print(sys.executable)"
+          python --version
+          python -c "import cryptography; print(f'Python3 cryptography version {cryptography.__version__}')"
+
+      # Checkout the specific tag/reference the run is targeting (for back
+      # porting).
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ github.event.inputs.tag || github.ref_name }}
+          fetch-depth: 0
+
+      - name: Configure
+        run: |
+          cmake -G 'Unix Makefiles' -S "$GITHUB_WORKSPACE" -B build \
+            -DCMAKE_BUILD_TYPE="$BUILD_TYPE" \
+            -DCMAKE_INSTALL_PREFIX="$GITHUB_WORKSPACE/dist" \
+            -DZLIB_USE_STATIC_LIBS=TRUE \
+            -DOPENSSL_USE_STATIC_LIBS=TRUE \
+            -DCMAKE_EXE_LINKER_FLAGS="-static -s"
+
+      - name: Build
+        run: cmake --build build
+
+      - name: Verify the binary is fully static
+        run: |
+          bin="build/osslsigncode"
+          file "$bin"
+          if ! file "$bin" | grep -q 'statically linked'; then
+            echo "::error::binary is not fully static"
+            ldd "$bin" || true
+            exit 1
+          fi
+
+      - name: Test
+        working-directory: build
+        run: |
+          ctest --output-on-failure -C "$BUILD_TYPE"
+
+      - name: Upload the errors
+        uses: actions/upload-artifact@v7
+        if: failure()
+        with:
+          name: errors-${{matrix.os}}
+          path: |
+            ${{github.workspace}}/build/Testing/Temporary/LastTest.log
+            ${{github.workspace}}/build/Testing/conf/makecerts.log
+            ${{github.workspace}}/build/Testing/logs/server.log
+            ${{github.workspace}}/build/Testing/logs/port.log
+
+      - name: Package
+        run: |
+          asset="osslsigncode-${VERSION}-linux-${{ matrix.arch }}"
+          install -Dm755 build/osslsigncode "stage/${asset}/osslsigncode"
+          cp COPYING "stage/${asset}/" 2>/dev/null || true
+          tar -C stage -czf "${asset}.tar.gz" "${asset}"
+          sha256sum "${asset}.tar.gz"
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: dist-linux-${{ matrix.arch }}
+          path: osslsigncode-*-linux-*.tar.gz
+          if-no-files-found: error
+
+  # --------------------------------------------------------------------------
+  # macOS: arm64 + x86_64. Third-party deps come from vcpkg static triplets, so
+  # the binary depends only on always-present system libraries. (A truly static
+  # binary is not possible on macOS -- libSystem must be dynamic.)
+  # --------------------------------------------------------------------------
+  macos:
+    name: macos-${{ matrix.arch }}
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - arch: arm64
+            os: macos-26
+            triplet: arm64-osx
+            osx_arch: arm64
+            py_arch: arm64
+          - arch: amd64
+            os: macos-26-intel
+            triplet: x64-osx
+            osx_arch: x86_64
+            py_arch: x64
+    runs-on: ${{ matrix.os }}
+    env:
+      VCPKG_ROOT: /usr/local/share/vcpkg
+      ZLIB_VERSION: 1.3.1
+      ZLIB_PREFIX: /tmp/zlibinstall
+      MIN_MACOS_VERSION: "14.0"
+    steps:
+      - name: Resolve version
+        run: echo "VERSION=${{ github.event.inputs.tag || github.ref_name }}" >> "$GITHUB_ENV"
+
+      # Macos doesn't have a static zlib build available (at least I couldn't
+      # figure out how to get one), so build and cache it.
+      - name: Restore cached ZLib
+        id: cache-zlib
+        uses: actions/cache@v6
+        with:
+          path: "${{env.ZLIB_PREFIX}}"
+          key: zlib-${{ env.ZLIB_VERSION }}-static-${{ matrix.arch }}-macos
+      - name: Build ZLib
+        if: steps.cache-zlib.outputs.cache-hit != 'true'
+        shell: sh
+        run: |
+          set -eux
+          cd /tmp
+          wget -O zlib.tar.gz \
+            "https://github.com/madler/zlib/releases/download/v${ZLIB_VERSION}/zlib-${ZLIB_VERSION}.tar.gz"
+          tar xf zlib.tar.gz
+          cd "zlib-${ZLIB_VERSION}"
+          # ./config auto-detects amd64 vs arm64, so it works for both matrix rows.
+          # no-module => legacy provider is compiled into libcrypto.a (no dlopen).
+          CFLAGS="-arch ${{ matrix.osx_arch }}" ./configure --static --prefix="${{env.ZLIB_PREFIX}}"
+          make -j"$(sysctl -n hw.ncpu)"
+          make install
+
+      # Setup xcode build environment
+      - name: Install Xcode (macOS)
+        uses: maxim-lobanov/setup-xcode@v1
+        with:
+          xcode-version: latest-stable
+
+      # By default cmake 4.0+ is used. However, this project targets a min
+      # version of 3.17.
+      - name: Setup the oldest supported version of cmake (macOS)
+        uses: jwlawson/actions-setup-cmake@v2
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.13'
+          architecture: ${{matrix.py_arch}}
+
+      - name: Install test dependency (cryptography)
+        run: |
+          python -m pip install --upgrade pip
+          ARCHFLAGS="-arch ${{ matrix.osx_arch }}" python -m pip install --upgrade cryptography
+          python -c "import sys; print(sys.executable)"
+          python --version
+          python -c "import cryptography; print(f'Python3 cryptography version {cryptography.__version__}')"
+
+      - name: Cache vcpkg archives
+        uses: actions/cache@v6
+        with:
+          path: /Users/runner/.cache/vcpkg/archives
+          key: release-${{ matrix.triplet }}-${{ hashFiles('vcpkg.json') }}
+          restore-keys: release-${{ matrix.triplet }}-
+
+      # Checkout the specific tag/reference the run is targeting (for back
+      # porting).
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ github.event.inputs.tag || github.ref_name }}
+          fetch-depth: 0
+
+      - name: Configure
+        run: |
+          cmake -G "Unix Makefiles" -S "${{github.workspace}}" -B "${{github.workspace}}/build" \
+            -DCMAKE_BUILD_TYPE="$BUILD_TYPE" \
+            -DCMAKE_INSTALL_PREFIX="$GITHUB_WORKSPACE/dist" \
+            -DCMAKE_OSX_ARCHITECTURES="${{ matrix.osx_arch }}" \
+            -DCMAKE_OSX_DEPLOYMENT_TARGET="${{env.MIN_MACOS_VERSION}}" \
+            -DZLIB_ROOT="${{env.ZLIB_PREFIX}}" \
+            -DZLIB_USE_STATIC_LIBS=TRUE \
+            -DOPENSSL_USE_STATIC_LIBS=TRUE
+
+      - name: Build
+        run: |
+          cmake --build "${{github.workspace}}/build" --config "$BUILD_TYPE"
+
+      - name: Verify no third-party dylibs are linked
+        run: |
+          bin="build/osslsigncode"
+          otool -L "$bin"
+          if otool -L "$bin" | grep -Ei 'vcpkg|Cellar|libssl|libcrypto'; then
+            echo "::error::binary links a non-system dylib"
+            exit 1
+          fi
+          strip -S "$bin" || true
+
+      - name: Test
+        working-directory: build
+        run: |
+          ctest --output-on-failure -C "$BUILD_TYPE"
+
+      - name: Upload the errors
+        uses: actions/upload-artifact@v7
+        if: failure()
+        with:
+          name: errors-${{matrix.os}}
+          path: |
+            ${{github.workspace}}/build/Testing/Temporary/LastTest.log
+            ${{github.workspace}}/build/Testing/conf/makecerts.log
+            ${{github.workspace}}/build/Testing/logs/server.log
+            ${{github.workspace}}/build/Testing/logs/port.log
+
+      - name: Package
+        run: |
+          asset="osslsigncode-${VERSION}-macos-${{ matrix.arch }}"
+          mkdir -p "stage/${asset}"
+          cp build/osslsigncode "stage/${asset}/"
+          cp COPYING "stage/${asset}/" 2>/dev/null || true
+          (cd stage && zip -r "../${asset}.zip" "${asset}")
+          shasum -a 256 "${asset}.zip"
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: dist-macos-${{ matrix.arch }}
+          path: osslsigncode-*-macos-*.zip
+          if-no-files-found: error
+
+  # --------------------------------------------------------------------------
+  # Windows: x64 + arm64, MSVC static triplet -> static CRT + static deps -> a single
+  # self-contained .exe (no vcredist / no third-party DLLs).
+  # --------------------------------------------------------------------------
+  windows:
+    name: windows-${{matrix.arch}}
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - arch: arm64
+            os: windows-11-arm
+            triplet: arm64-windows-static
+            vs_arch: arm64
+            win_arch: arm64
+          - arch: amd64
+            os: windows-latest
+            triplet: x64-windows-static
+            vs_arch: amd64
+            win_arch: x64
+    runs-on: ${{matrix.os}}
+    env:
+      VCPKG_ROOT: C:/vcpkg
+    steps:
+      - name: Resolve version
+        shell: bash
+        run: echo "VERSION=${{ github.event.inputs.tag || github.ref_name }}" >> "$GITHUB_ENV"
+
+      - name: Configure Visual Studio
+        uses: step-security/msvc-dev-cmd@v1
+        with:
+          arch: ${{matrix.vs_arch}}
+
+      # Python setup
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.13'
+          architecture: x64
+      - name: Install test dependency (cryptography)
+        run: |
+          python -m ensurepip
+          python -m pip install --upgrade pip
+          python -m pip install --upgrade pip cryptography
+          python.exe -c "import sys; print(sys.executable)"
+          python.exe --version
+          python.exe -c "import cryptography; print(f'Python3 cryptography version {cryptography.__version__}')"
+
+      - name: Cache vcpkg archives
+        uses: actions/cache@v6
+        with:
+          path: C:/Users/runneradmin/AppData/Local/vcpkg/archives
+          key: release-${{matrix.triplet}}-windows-static-${{ hashFiles('vcpkg.json') }}
+          restore-keys: release-${{matrix.triplet}}-windows-static-
+
+      # Checkout the specific tag/reference the run is targeting (for back
+      # porting).
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ github.event.inputs.tag || github.ref_name }}
+          fetch-depth: 0
+
+      # Handle the CETCOMPAT patch for older versions to support building
+      # past tags.
+      - name: Checkout patch (from workflow ref)
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ github.ref }} # the release branch/ref, has the patch
+          sparse-checkout: .github/workflows/patches
+          sparse-checkout-cone-mode: false
+          path: ci-patches
+      - name: Apply CETCOMPAT arch guard
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Skip if the tag already contains the fix
+          if grep -qE 'MSVC_C_ARCHITECTURE_ID MATCHES' cmake/SetCompilerFlags.cmake;  then
+            echo "Fix already present; nothing to patch."
+            exit 0
+          fi
+          if git apply --3way --check ci-patches/.github/workflows/patches/cetcompat-arch-guard.patch 2>/dev/null; then
+            git apply --3way ci-patches/.github/workflows/patches/cetcompat-arch-guard.patch
+            echo "Patch applied cleanly."
+          else
+            echo "Context mismatch on this tag; falling back to in-place guard."
+            perl -0pi -e 's{(\s*)target_link_options\(\$\{target\} PRIVATE /CETCOMPAT\)}{$1if(MSVC_C_ARCHITECTURE_ID MATCHES "^(X86|x64|AMD64)\$")\n$1 target_link_options(\$\{target\} PRIVATE /CETCOMPAT)\n$1endif()}g' cmake/SetCompilerFlags.cmake
+          fi
+          git --no-pager diff -- cmake/SetCompilerFlags.cmake || true
+
+      - name: Configure
+        run: |
+          cmake -G Ninja -S "${{ github.workspace }}" -B build `
+            -DCMAKE_BUILD_TYPE="${{ env.BUILD_TYPE }}" `
+            -DCMAKE_INSTALL_PREFIX="${{ github.workspace }}/dist" `
+            -DCMAKE_TOOLCHAIN_FILE="$env:VCPKG_ROOT/scripts/buildsystems/vcpkg.cmake" `
+            -DVCPKG_TARGET_ARCHITECTURE="${{matrix.win_arch}}" `
+            -DVCPKG_TARGET_TRIPLET="${{ matrix.triplet }}" `
+            -DZLIB_USE_STATIC_LIBS=TRUE `
+            -DOPENSSL_USE_STATIC_LIBS=TRUE
+
+      - name: Build
+        run: cmake --build build --config ${{ env.BUILD_TYPE }}
+
+      - name: Test
+        working-directory: build
+        run: |
+          ctest -C ${{ env.BUILD_TYPE }} --output-on-failure
+
+      - name: Upload the errors
+        uses: actions/upload-artifact@v7
+        if: failure()
+        with:
+          name: errors-${{matrix.os}}
+          path: |
+            ${{github.workspace}}/build/Testing/Temporary/LastTest.log
+            ${{github.workspace}}/build/Testing/conf/makecerts.log
+            ${{github.workspace}}/build/Testing/logs/server.log
+            ${{github.workspace}}/build/Testing/logs/port.log
+
+      - name: Package
+        shell: bash
+        run: |
+          asset="osslsigncode-${VERSION}-windows-${{matrix.arch}}"
+          mkdir -p "stage/${asset}"
+          cp build/osslsigncode.exe "stage/${asset}/"
+          cp COPYING "stage/${asset}/" 2>/dev/null || true
+          (cd stage && 7z a -tzip "../${asset}.zip" "${asset}")
+          sha256sum "${asset}.zip"
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: dist-windows-${{matrix.arch}}
+          path: osslsigncode-*-windows-*.zip
+          if-no-files-found: error
+
+  # --------------------------------------------------------------------------
+  # Publish: collect every artifact, generate SHA256SUMS.txt, attach to release.
+  # --------------------------------------------------------------------------
+  release:
+    needs: [linux, macos, windows]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write   # required to create/modify the release
+    steps:
+      - name: Download all build artifacts
+        uses: actions/download-artifact@v8
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Generate checksums
+        run: |
+          cd dist
+          sha256sum * > SHA256SUMS.txt
+          echo "----- SHA256SUMS.txt -----"
+          cat SHA256SUMS.txt
+
+      - name: Create / update the GitHub release
+        uses: softprops/action-gh-release@v3
+        with:
+          tag_name: ${{ github.event.inputs.tag || github.ref_name }}
+          name: ${{ github.event.inputs.tag || github.ref_name }}
+          draft: true
+          prerelease: ${{ contains(github.event.inputs.tag || github.ref_name, '-') }}
+          generate_release_notes: true
+          fail_on_unmatched_files: true
+          files: |
+            dist/*.tar.gz
+            dist/*.zip
+            dist/SHA256SUMS.txt

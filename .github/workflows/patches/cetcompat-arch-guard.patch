@@ -1,0 +1,15 @@
+diff --git a/cmake/SetCompilerFlags.cmake b/cmake/SetCompilerFlags.cmake
+index 478f824..affab57 100644
+--- a/cmake/SetCompilerFlags.cmake
++++ b/cmake/SetCompilerFlags.cmake
+@@ -59,7 +59,9 @@ function(add_compile_flags target)
+         # Create terminal server aware application (default on)
+         target_link_options(${target} PRIVATE /TSAWARE)
+         # Mark the binary as compatible with Intel Control-flow Enforcement Technology (CET) Shadow Stack
+-        target_link_options(${target} PRIVATE /CETCOMPAT)
++        if(MSVC_C_ARCHITECTURE_ID MATCHES "^(X86|x64|AMD64)$")
++            target_link_options(${target} PRIVATE /CETCOMPAT)
++        endif()
+         # Enable compiler generation of Control Flow Guard security checks
+         target_compile_options(${target} PRIVATE /guard:cf)
+         target_link_options(${target} PRIVATE /guard:cf)

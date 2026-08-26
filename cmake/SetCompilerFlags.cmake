@@ -59,7 +59,10 @@ function(add_compile_flags target)
         # Create terminal server aware application (default on)
         target_link_options(${target} PRIVATE /TSAWARE)
         # Mark the binary as compatible with Intel Control-flow Enforcement Technology (CET) Shadow Stack
-        target_link_options(${target} PRIVATE /CETCOMPAT)
+        # /CETCOMPAT is only valid for x86/x64 targets; it errors with LNK1246 on ARM/ARM64.
+        if(MSVC_C_ARCHITECTURE_ID MATCHES "^(X86|x64|AMD64)$")
+            target_link_options(${target} PRIVATE /CETCOMPAT)
+        endif()
         # Enable compiler generation of Control Flow Guard security checks
         target_compile_options(${target} PRIVATE /guard:cf)
         target_link_options(${target} PRIVATE /guard:cf)
