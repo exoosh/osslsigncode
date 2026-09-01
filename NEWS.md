@@ -2,6 +2,8 @@
 
 ### 2.15 (unreleased)
 
+- fixed Cygwin compilation by not passing ELF-specific linker flags
+
 ### 2.14 (2026.07.20)
 
 - added comprehensive command documentation in Markdown; man page and HTML
